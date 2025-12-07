@@ -1331,9 +1331,779 @@ logger.info("signal_detected",
 
 ---
 
-## 11. 风险提示
+## 11. 自动交易模块
 
-### 11.1 系统性风险
+### 11.1 交易执行架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          自动交易执行层                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌──────────┐ │
+│  │  信号接收   │───▶│  风控检查   │───▶│  订单生成   │───▶│ 执行引擎  │ │
+│  └─────────────┘    └─────────────┘    └─────────────┘    └──────────┘ │
+│         │                  │                  │                 │       │
+│         ▼                  ▼                  ▼                 ▼       │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌──────────┐ │
+│  │ TradeSignal │    │ 仓位限制    │    │ 市价/限价   │    │ CLOB API │ │
+│  │ from Arb    │    │ 敞口控制    │    │ 滑点保护    │    │ 订单提交 │ │
+│  │ Detector    │    │ 频率限制    │    │ 紧急度优先  │    │ 状态追踪 │ │
+│  └─────────────┘    └─────────────┘    └─────────────┘    └──────────┘ │
+│                                                                         │
+│                              ┌─────────────┐                            │
+│                              │  订单管理   │                            │
+│                              │  ─────────  │                            │
+│                              │ • 挂单追踪  │                            │
+│                              │ • 成交确认  │                            │
+│                              │ • 自动撤单  │                            │
+│                              │ • 仓位同步  │                            │
+│                              └─────────────┘                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 11.2 订单数据模型
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+import uuid
+
+class OrderSide(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+class OrderType(Enum):
+    MARKET = "MARKET"       # 市价单 - 立即成交
+    LIMIT = "LIMIT"         # 限价单 - 指定价格
+    FOK = "FOK"             # Fill or Kill - 全部成交或取消
+    IOC = "IOC"             # Immediate or Cancel - 立即成交剩余取消
+
+class OrderStatus(Enum):
+    PENDING = "PENDING"         # 待提交
+    SUBMITTED = "SUBMITTED"     # 已提交
+    OPEN = "OPEN"               # 挂单中
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"  # 部分成交
+    FILLED = "FILLED"           # 完全成交
+    CANCELLED = "CANCELLED"     # 已取消
+    REJECTED = "REJECTED"       # 被拒绝
+    EXPIRED = "EXPIRED"         # 已过期
+
+@dataclass
+class Order:
+    """订单"""
+    order_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    market_id: str = ""
+    token_id: str = ""              # YES 或 NO 的 token ID
+    side: OrderSide = OrderSide.BUY
+    order_type: OrderType = OrderType.LIMIT
+
+    # 价格与数量
+    price: float = 0.0              # 限价单价格 (0-1)
+    size: float = 0.0               # 下注金额 (USDC)
+    filled_size: float = 0.0        # 已成交金额
+
+    # 状态
+    status: OrderStatus = OrderStatus.PENDING
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+
+    # 交易所返回
+    exchange_order_id: Optional[str] = None
+    fill_price: Optional[float] = None      # 平均成交价
+    error_message: Optional[str] = None
+
+    # 来源信号
+    signal: Optional[TradeSignal] = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in (OrderStatus.SUBMITTED, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
+
+    @property
+    def is_complete(self) -> bool:
+        return self.status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED)
+
+    @property
+    def remaining_size(self) -> float:
+        return self.size - self.filled_size
+
+
+@dataclass
+class Position:
+    """持仓"""
+    market_id: str
+    token_id: str
+    side: str                       # "YES" or "NO"
+
+    size: float                     # 持有数量 (shares)
+    avg_cost: float                 # 平均成本
+    current_price: float            # 当前市价
+
+    unrealized_pnl: float = 0.0     # 未实现盈亏
+    realized_pnl: float = 0.0       # 已实现盈亏
+
+    @property
+    def market_value(self) -> float:
+        return self.size * self.current_price
+
+    @property
+    def total_cost(self) -> float:
+        return self.size * self.avg_cost
+
+
+@dataclass
+class TradeRecord:
+    """成交记录"""
+    trade_id: str
+    order_id: str
+    market_id: str
+    side: str
+
+    price: float
+    size: float
+    fee: float
+
+    timestamp: datetime
+    pnl: Optional[float] = None     # 平仓时的盈亏
+```
+
+### 11.3 风控模块
+
+```python
+from dataclasses import dataclass
+from typing import Optional
+import time
+
+@dataclass
+class RiskLimits:
+    """风控限制配置"""
+    # 仓位限制
+    max_position_size: float = 50           # 单笔最大下注 (USDC)
+    max_total_exposure: float = 200         # 总敞口上限
+    max_position_per_market: float = 100    # 单市场最大敞口
+
+    # 亏损限制
+    max_daily_loss: float = 50              # 日最大亏损
+    max_drawdown_pct: float = 0.10          # 最大回撤比例 (10%)
+
+    # 频率限制
+    min_order_interval: float = 1.0         # 最小下单间隔 (秒)
+    max_orders_per_minute: int = 10         # 每分钟最大订单数
+
+    # 信号质量限制
+    min_edge: float = 0.03                  # 最小优势
+    min_ev: float = 0.01                    # 最小期望值
+    min_time_remaining: int = 30            # 最小剩余时间 (秒)
+    max_slippage: float = 0.02              # 最大滑点容忍
+
+
+class RiskManager:
+    """风控管理器"""
+
+    def __init__(self, limits: RiskLimits, initial_balance: float):
+        self.limits = limits
+        self.initial_balance = initial_balance
+        self.current_balance = initial_balance
+
+        # 状态追踪
+        self.daily_pnl: float = 0.0
+        self.peak_balance: float = initial_balance
+        self.positions: dict[str, Position] = {}
+        self.order_timestamps: list[float] = []
+
+        # 熔断状态
+        self.is_halted: bool = False
+        self.halt_reason: Optional[str] = None
+
+    def check_order(self, order: Order, signal: TradeSignal) -> tuple[bool, Optional[str]]:
+        """
+        检查订单是否通过风控
+
+        Returns:
+            (通过, 拒绝原因)
+        """
+        # 1. 熔断检查
+        if self.is_halted:
+            return False, f"Trading halted: {self.halt_reason}"
+
+        # 2. 信号质量检查
+        if signal.mispricing < self.limits.min_edge:
+            return False, f"Edge too low: {signal.mispricing:.2%} < {self.limits.min_edge:.2%}"
+
+        if signal.ev < self.limits.min_ev:
+            return False, f"EV too low: {signal.ev:.4f} < {self.limits.min_ev}"
+
+        # 3. 仓位检查
+        if order.size > self.limits.max_position_size:
+            return False, f"Order size {order.size} exceeds max {self.limits.max_position_size}"
+
+        total_exposure = self._calculate_total_exposure()
+        if total_exposure + order.size > self.limits.max_total_exposure:
+            return False, f"Would exceed total exposure limit: {total_exposure + order.size} > {self.limits.max_total_exposure}"
+
+        market_exposure = self._get_market_exposure(order.market_id)
+        if market_exposure + order.size > self.limits.max_position_per_market:
+            return False, f"Would exceed market exposure limit"
+
+        # 4. 亏损检查
+        if self.daily_pnl < -self.limits.max_daily_loss:
+            self._halt("Daily loss limit reached")
+            return False, "Daily loss limit reached"
+
+        drawdown = (self.peak_balance - self.current_balance) / self.peak_balance
+        if drawdown > self.limits.max_drawdown_pct:
+            self._halt(f"Max drawdown reached: {drawdown:.2%}")
+            return False, f"Max drawdown reached: {drawdown:.2%}"
+
+        # 5. 频率检查
+        now = time.time()
+        self.order_timestamps = [t for t in self.order_timestamps if now - t < 60]
+
+        if len(self.order_timestamps) >= self.limits.max_orders_per_minute:
+            return False, "Order rate limit exceeded"
+
+        if self.order_timestamps and (now - self.order_timestamps[-1]) < self.limits.min_order_interval:
+            return False, "Min order interval not met"
+
+        return True, None
+
+    def on_order_submitted(self, order: Order):
+        """订单提交后更新状态"""
+        self.order_timestamps.append(time.time())
+
+    def on_trade(self, trade: TradeRecord):
+        """成交后更新状态"""
+        self.daily_pnl += (trade.pnl or 0) - trade.fee
+        self.current_balance += (trade.pnl or 0) - trade.fee
+        self.peak_balance = max(self.peak_balance, self.current_balance)
+
+    def _calculate_total_exposure(self) -> float:
+        return sum(p.market_value for p in self.positions.values())
+
+    def _get_market_exposure(self, market_id: str) -> float:
+        return sum(
+            p.market_value for p in self.positions.values()
+            if p.market_id == market_id
+        )
+
+    def _halt(self, reason: str):
+        self.is_halted = True
+        self.halt_reason = reason
+
+    def reset_daily(self):
+        """每日重置"""
+        self.daily_pnl = 0
+        self.is_halted = False
+        self.halt_reason = None
+```
+
+### 11.4 Polymarket 交易执行器
+
+```python
+import hmac
+import hashlib
+import time
+from typing import Optional
+import aiohttp
+
+class PolymarketTrader:
+    """
+    Polymarket CLOB 交易执行器
+
+    API 文档: https://docs.polymarket.com/
+    需要 API Key 进行签名认证
+    """
+
+    CLOB_URL = "https://clob.polymarket.com"
+
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        passphrase: str,
+        risk_manager: RiskManager
+    ):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.passphrase = passphrase
+        self.risk_manager = risk_manager
+
+        self._session: Optional[aiohttp.ClientSession] = None
+        self.active_orders: dict[str, Order] = {}
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    def _sign_request(self, method: str, path: str, body: str = "") -> dict:
+        """生成签名 headers"""
+        timestamp = str(int(time.time() * 1000))
+        message = timestamp + method.upper() + path + body
+
+        signature = hmac.new(
+            self.api_secret.encode(),
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        return {
+            "POLY_API_KEY": self.api_key,
+            "POLY_SIGNATURE": signature,
+            "POLY_TIMESTAMP": timestamp,
+            "POLY_PASSPHRASE": self.passphrase,
+            "Content-Type": "application/json"
+        }
+
+    async def execute_signal(self, signal: TradeSignal, market: BinaryMarket) -> Optional[Order]:
+        """
+        执行交易信号
+
+        流程:
+        1. 构建订单
+        2. 风控检查
+        3. 提交订单
+        4. 追踪状态
+        """
+        # 1. 构建订单
+        order = self._build_order(signal, market)
+
+        # 2. 风控检查
+        passed, reason = self.risk_manager.check_order(order, signal)
+        if not passed:
+            order.status = OrderStatus.REJECTED
+            order.error_message = reason
+            return order
+
+        # 3. 提交订单
+        try:
+            result = await self._submit_order(order)
+            order.exchange_order_id = result.get("orderID")
+            order.status = OrderStatus.SUBMITTED
+            self.active_orders[order.order_id] = order
+            self.risk_manager.on_order_submitted(order)
+
+        except Exception as e:
+            order.status = OrderStatus.REJECTED
+            order.error_message = str(e)
+
+        return order
+
+    def _build_order(self, signal: TradeSignal, market: BinaryMarket) -> Order:
+        """根据信号构建订单"""
+        # 确定 token_id
+        if signal.side == "YES":
+            token_id = market.yes_token_id
+            quote = market.yes_quote
+        else:
+            token_id = market.no_token_id
+            quote = market.no_quote
+
+        # 根据紧急度选择订单类型
+        if signal.urgency == "HIGH":
+            order_type = OrderType.MARKET
+            price = quote.ask * 1.01  # 略高于卖一价确保成交
+        else:
+            order_type = OrderType.LIMIT
+            price = min(quote.ask, signal.fair_price * 0.98)  # 尝试更好价格
+
+        return Order(
+            market_id=market.market_id,
+            token_id=token_id,
+            side=OrderSide.BUY,
+            order_type=order_type,
+            price=price,
+            size=signal.suggested_size,
+            signal=signal
+        )
+
+    async def _submit_order(self, order: Order) -> dict:
+        """提交订单到 CLOB"""
+        session = await self._get_session()
+
+        path = "/order"
+        body = {
+            "tokenID": order.token_id,
+            "side": order.side.value,
+            "type": order.order_type.value,
+            "price": str(order.price),
+            "size": str(order.size),
+        }
+
+        if order.order_type == OrderType.FOK:
+            body["timeInForce"] = "FOK"
+        elif order.order_type == OrderType.IOC:
+            body["timeInForce"] = "IOC"
+
+        import json
+        body_str = json.dumps(body)
+        headers = self._sign_request("POST", path, body_str)
+
+        async with session.post(
+            f"{self.CLOB_URL}{path}",
+            headers=headers,
+            data=body_str
+        ) as resp:
+            if resp.status != 200:
+                error = await resp.text()
+                raise Exception(f"Order failed: {error}")
+            return await resp.json()
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """撤销订单"""
+        session = await self._get_session()
+
+        path = f"/order/{order_id}"
+        headers = self._sign_request("DELETE", path)
+
+        async with session.delete(
+            f"{self.CLOB_URL}{path}",
+            headers=headers
+        ) as resp:
+            if resp.status == 200:
+                if order_id in self.active_orders:
+                    self.active_orders[order_id].status = OrderStatus.CANCELLED
+                return True
+            return False
+
+    async def get_order_status(self, order_id: str) -> dict:
+        """查询订单状态"""
+        session = await self._get_session()
+
+        path = f"/order/{order_id}"
+        headers = self._sign_request("GET", path)
+
+        async with session.get(
+            f"{self.CLOB_URL}{path}",
+            headers=headers
+        ) as resp:
+            return await resp.json()
+
+    async def sync_positions(self) -> list[Position]:
+        """同步持仓"""
+        session = await self._get_session()
+
+        path = "/positions"
+        headers = self._sign_request("GET", path)
+
+        async with session.get(
+            f"{self.CLOB_URL}{path}",
+            headers=headers
+        ) as resp:
+            data = await resp.json()
+
+            positions = []
+            for p in data:
+                positions.append(Position(
+                    market_id=p["conditionId"],
+                    token_id=p["tokenId"],
+                    side=p["outcome"],
+                    size=float(p["size"]),
+                    avg_cost=float(p["avgCost"]),
+                    current_price=float(p.get("currentPrice", p["avgCost"]))
+                ))
+
+            # 更新风控管理器
+            self.risk_manager.positions = {p.token_id: p for p in positions}
+
+            return positions
+
+    async def close_position(self, position: Position) -> Optional[Order]:
+        """平仓"""
+        # 卖出持有的份额
+        order = Order(
+            market_id=position.market_id,
+            token_id=position.token_id,
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            price=position.current_price * 0.99,  # 略低于市价确保成交
+            size=position.size
+        )
+
+        try:
+            result = await self._submit_order(order)
+            order.exchange_order_id = result.get("orderID")
+            order.status = OrderStatus.SUBMITTED
+            return order
+        except Exception as e:
+            order.status = OrderStatus.REJECTED
+            order.error_message = str(e)
+            return order
+```
+
+### 11.5 订单管理器
+
+```python
+import asyncio
+from typing import Callable, Optional
+
+class OrderManager:
+    """
+    订单生命周期管理
+
+    - 追踪活跃订单
+    - 自动过期撤单
+    - 部分成交处理
+    - 事件回调
+    """
+
+    def __init__(
+        self,
+        trader: PolymarketTrader,
+        on_fill: Optional[Callable] = None,
+        on_cancel: Optional[Callable] = None
+    ):
+        self.trader = trader
+        self.on_fill = on_fill
+        self.on_cancel = on_cancel
+
+        self._running = False
+
+    async def start(self, poll_interval: float = 1.0):
+        """启动订单追踪"""
+        self._running = True
+
+        while self._running:
+            await self._poll_orders()
+            await asyncio.sleep(poll_interval)
+
+    async def stop(self):
+        self._running = False
+
+    async def _poll_orders(self):
+        """轮询订单状态"""
+        for order_id, order in list(self.trader.active_orders.items()):
+            if not order.is_active:
+                continue
+
+            try:
+                status = await self.trader.get_order_status(order.exchange_order_id)
+                await self._update_order(order, status)
+            except Exception as e:
+                print(f"Error polling order {order_id}: {e}")
+
+    async def _update_order(self, order: Order, status: dict):
+        """更新订单状态"""
+        old_status = order.status
+        new_status_str = status.get("status", "").upper()
+
+        # 映射状态
+        status_map = {
+            "OPEN": OrderStatus.OPEN,
+            "FILLED": OrderStatus.FILLED,
+            "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
+            "CANCELLED": OrderStatus.CANCELLED,
+            "EXPIRED": OrderStatus.EXPIRED,
+        }
+
+        if new_status_str in status_map:
+            order.status = status_map[new_status_str]
+
+        # 更新成交信息
+        filled = float(status.get("filledSize", 0))
+        if filled > order.filled_size:
+            order.filled_size = filled
+            order.fill_price = float(status.get("avgFillPrice", order.price))
+
+            if self.on_fill:
+                await self.on_fill(order)
+
+        # 完成的订单移出活跃列表
+        if order.is_complete:
+            del self.trader.active_orders[order.order_id]
+
+            if order.status == OrderStatus.CANCELLED and self.on_cancel:
+                await self.on_cancel(order)
+
+    async def cancel_stale_orders(self, max_age_seconds: float = 30):
+        """撤销过期订单"""
+        now = datetime.utcnow()
+
+        for order in list(self.trader.active_orders.values()):
+            age = (now - order.created_at).total_seconds()
+
+            if age > max_age_seconds and order.status == OrderStatus.OPEN:
+                await self.trader.cancel_order(order.exchange_order_id)
+```
+
+### 11.6 自动交易主循环
+
+```python
+class AutoTrader:
+    """
+    自动交易主控
+
+    整合信号检测、风控、执行
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+
+        # 风控
+        self.risk_manager = RiskManager(
+            limits=RiskLimits(
+                max_position_size=config.get("risk.max_position", 50),
+                max_total_exposure=config.get("risk.max_exposure", 200),
+                max_daily_loss=config.get("risk.max_daily_loss", 50),
+            ),
+            initial_balance=config.get("risk.bankroll", 1000)
+        )
+
+        # 交易执行
+        self.trader = PolymarketTrader(
+            api_key=config.get("trading.api_key"),
+            api_secret=config.get("trading.api_secret"),
+            passphrase=config.get("trading.passphrase"),
+            risk_manager=self.risk_manager
+        )
+
+        # 订单管理
+        self.order_manager = OrderManager(
+            trader=self.trader,
+            on_fill=self._on_fill,
+            on_cancel=self._on_cancel
+        )
+
+        # 模式
+        self.paper_trading = config.get("trading.paper_mode", True)
+        self.auto_execute = config.get("trading.auto_execute", False)
+
+        # 统计
+        self.signals_received = 0
+        self.orders_executed = 0
+        self.orders_filled = 0
+
+    async def on_signal(self, signal: TradeSignal, market: BinaryMarket):
+        """
+        接收交易信号
+
+        根据配置决定自动执行或仅记录
+        """
+        self.signals_received += 1
+
+        # Paper trading 模式
+        if self.paper_trading:
+            await self._paper_trade(signal, market)
+            return
+
+        # 自动执行模式
+        if self.auto_execute:
+            order = await self.trader.execute_signal(signal, market)
+
+            if order and order.status == OrderStatus.SUBMITTED:
+                self.orders_executed += 1
+                print(f"Order submitted: {order.order_id} - {signal.side} @ {signal.market_price:.2%}")
+            elif order:
+                print(f"Order rejected: {order.error_message}")
+
+    async def _paper_trade(self, signal: TradeSignal, market: BinaryMarket):
+        """模拟交易"""
+        print(f"[PAPER] Would {signal.action} {signal.side}")
+        print(f"        Size: ${signal.suggested_size:.2f}")
+        print(f"        Price: {signal.market_price:.2%}")
+        print(f"        Edge: {signal.mispricing:.2%}")
+        print(f"        EV: +${signal.ev:.2f}")
+
+    async def _on_fill(self, order: Order):
+        """成交回调"""
+        self.orders_filled += 1
+
+        pnl = 0  # 买入时 pnl 为 0，卖出时计算
+        fee = order.filled_size * 0.001  # 假设 0.1% 手续费
+
+        trade = TradeRecord(
+            trade_id=str(uuid.uuid4()),
+            order_id=order.order_id,
+            market_id=order.market_id,
+            side=order.side.value,
+            price=order.fill_price,
+            size=order.filled_size,
+            fee=fee,
+            timestamp=datetime.utcnow(),
+            pnl=pnl
+        )
+
+        self.risk_manager.on_trade(trade)
+
+        print(f"Order filled: {order.order_id}")
+        print(f"  Price: {order.fill_price:.2%}")
+        print(f"  Size: ${order.filled_size:.2f}")
+
+    async def _on_cancel(self, order: Order):
+        """撤单回调"""
+        print(f"Order cancelled: {order.order_id}")
+
+    async def run(self):
+        """启动自动交易"""
+        # 同步持仓
+        await self.trader.sync_positions()
+
+        # 启动订单管理
+        order_task = asyncio.create_task(self.order_manager.start())
+
+        try:
+            while True:
+                await asyncio.sleep(1)
+        finally:
+            await self.order_manager.stop()
+            order_task.cancel()
+
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        return {
+            "signals_received": self.signals_received,
+            "orders_executed": self.orders_executed,
+            "orders_filled": self.orders_filled,
+            "fill_rate": self.orders_filled / self.orders_executed if self.orders_executed > 0 else 0,
+            "daily_pnl": self.risk_manager.daily_pnl,
+            "current_balance": self.risk_manager.current_balance,
+            "is_halted": self.risk_manager.is_halted,
+        }
+```
+
+### 11.7 交易配置
+
+```yaml
+# config/settings.yaml 追加
+
+# 交易配置
+trading:
+  # 模式
+  paper_mode: true          # 模拟交易模式 (强烈建议先用此模式)
+  auto_execute: false       # 自动执行 (需关闭 paper_mode)
+
+  # API 认证
+  api_key: ${POLYMARKET_API_KEY}
+  api_secret: ${POLYMARKET_API_SECRET}
+  passphrase: ${POLYMARKET_PASSPHRASE}
+
+  # 执行参数
+  default_order_type: "LIMIT"   # MARKET / LIMIT / FOK / IOC
+  max_slippage: 0.02            # 最大滑点 2%
+  order_timeout: 30             # 订单超时撤单 (秒)
+
+# 风控配置
+risk:
+  bankroll: 1000                # 总资金
+  max_position: 50              # 单笔最大
+  max_exposure: 200             # 总敞口
+  max_daily_loss: 50            # 日亏损上限
+  max_drawdown_pct: 0.10        # 最大回撤 10%
+
+  # 频率限制
+  min_order_interval: 1.0       # 最小下单间隔
+  max_orders_per_minute: 10     # 每分钟最大订单
+```
+
+---
+
+## 12. 风险提示
+
+### 12.1 系统性风险
 
 | 风险类型 | 描述 | 缓解措施 |
 |---------|------|---------|
@@ -1342,7 +2112,7 @@ logger.info("signal_detected",
 | 流动性不足 | 无法以预期价格成交 | 检查深度，限制单笔金额 |
 | 模型失效 | 极端行情下定价模型失准 | 设置置信度门槛，异常波动暂停 |
 
-### 11.2 操作建议
+### 12.2 操作建议
 
 1. **从模拟开始**：先运行 paper trading 模式验证策略
 2. **小额试水**：真实交易从最小仓位开始
@@ -1351,17 +2121,19 @@ logger.info("signal_detected",
 
 ---
 
-## 12. 后续迭代规划
+## 13. 后续迭代规划
 
 ### Phase 1: MVP (当前文档)
 - [x] 核心定价模型
 - [x] 单市场监控
 - [x] 终端警报
+- [x] 自动交易执行 (买入/卖出)
+- [x] 风控模块
 
 ### Phase 2: 增强
 - [ ] 多市场并行监控
 - [ ] 历史数据回测框架
-- [ ] 自动下单执行
+- [ ] WebSocket 实时订单更新
 
 ### Phase 3: 进阶
 - [ ] 机器学习定价模型
